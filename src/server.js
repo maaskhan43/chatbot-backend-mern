@@ -9,7 +9,7 @@ connectDB();
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Gemini Chatbot Backend running on port ${PORT}`);
-  console.log(`📊 Health check: ${BACKEND_URL}/health`);
-  console.log(`🔐 Admin login: POST ${BACKEND_URL}/admin/auth/login`);
+  console.log(`📊 Health check: https://chatbot-backend-mern.onrender.com/health`);
+  console.log(`🔐 Admin login: POST https://chatbot-backend-mern.onrender.com/admin/auth/login`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
