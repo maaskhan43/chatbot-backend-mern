@@ -7,9 +7,9 @@ const chatController = require('../controllers/chat.controller');
 // @access  Public
 router.get('/priority-questions/:clientId', chatController.getPriorityQuestions);
 
-// @route   POST /api/chat/search
+// @route   POST /api/chat/semantic-search
 // @desc    Perform semantic search on Q&A data
 // @access  Public
-router.post('/search', chatController.semanticSearch);
+router.post('/semantic-search', chatController.semanticSearch);
 
 module.exports = router;
