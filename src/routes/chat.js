@@ -12,4 +12,6 @@ router.get('/priority-questions/:clientId', chatController.getPriorityQuestions)
 // @access  Public
 router.post('/semantic-search', chatController.semanticSearch);
 
+router.post('/suggestion-click', chatController.handleSuggestionClick);
+
 module.exports = router;
