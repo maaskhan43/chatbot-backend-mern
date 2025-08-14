@@ -8,6 +8,7 @@ class ChatController {
   constructor() {
     this.getPriorityQuestions = this.getPriorityQuestions.bind(this);
     this.semanticSearch = this.semanticSearch.bind(this);
+    this.handleSuggestionClick = this.handleSuggestionClick.bind(this);
     this.saveChatInteraction = this.saveChatInteraction.bind(this);
     this.getChatHistory = this.getChatHistory.bind(this);
     this.getChatSessions = this.getChatSessions.bind(this);
@@ -391,6 +392,139 @@ Generate a greeting response:`;
     console.log('--- Search Request Finished ---\n');
   }
 
+  // Handle suggestion click with Gemini AI enhancement
+  async handleSuggestionClick(req, res) {
+    const { originalQuestion, userLanguage = 'en', clientId, sessionId } = req.body;
+
+    try {
+      console.log(`[SUGGESTION-CLICK] Processing for client: ${clientId}, question: "${originalQuestion}"`);
+      
+      if (!originalQuestion || !clientId) {
+        return res.status(400).json({
+          success: false,
+          message: 'Missing required fields: originalQuestion and clientId'
+        });
+      }
+
+      // Verify client exists
+      const client = await Client.findById(clientId);
+      if (!client) {
+        return res.status(404).json({
+          success: false,
+          message: 'Client not found'
+        });
+      }
+
+      // Get Q&A data for the client
+      const qaData = await ClientQA.find({ clientId }).select('question answer embedding priority');
+      
+      if (!qaData || qaData.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'No Q&A data found for this client'
+        });
+      }
+
+      // Find the matching answer
+      let bestMatch = null;
+      let bestScore = 0;
+
+      for (const qa of qaData) {
+        // Check for exact match first
+        if (qa.question.toLowerCase().trim() === originalQuestion.toLowerCase().trim()) {
+          bestMatch = qa;
+          bestScore = 1.0;
+          break;
+        }
+        
+        // Simple text similarity as fallback
+        const words1 = originalQuestion.toLowerCase().split(' ');
+        const words2 = qa.question.toLowerCase().split(' ');
+        const commonWords = words1.filter(word => words2.includes(word));
+        const similarity = commonWords.length / Math.max(words1.length, words2.length);
+        
+        if (similarity > bestScore) {
+          bestMatch = qa;
+          bestScore = similarity;
+        }
+      }
+
+      if (!bestMatch || bestScore < 0.3) {
+        return res.status(404).json({
+          success: false,
+          message: 'No matching answer found for the selected question'
+        });
+      }
+
+      // Enhanced flow: Process answer through Gemini AI for beautification
+      let enhancedAnswer = bestMatch.answer;
+      
+      try {
+        const enhancementPrompt = `
+You are a professional customer service assistant. Please enhance and beautify the following answer to make it more natural, polished, and user-friendly while maintaining all the original information.
+
+Original Question: "${originalQuestion}"
+User Language: ${userLanguage}
+Raw Answer: "${bestMatch.answer}"
+
+Guidelines:
+1. Make the response sound more conversational and natural
+2. Maintain all factual information from the original answer
+3. Respond in ${userLanguage === 'en' ? 'English' : userLanguage}
+4. Use proper formatting with bullet points or paragraphs if needed
+5. Be helpful and professional
+6. Keep the same core meaning but improve readability
+
+Enhanced Answer:`;
+
+        const geminiResponse = await GeminiService.generateText(enhancementPrompt);
+        enhancedAnswer = geminiResponse.trim() || bestMatch.answer;
+        
+        console.log(`[GEMINI-ENHANCEMENT] Original: "${bestMatch.answer.substring(0, 100)}..." | Enhanced: "${enhancedAnswer.substring(0, 100)}..."`);
+      } catch (geminiError) {
+        console.log(`[GEMINI-ENHANCEMENT] Failed to enhance answer: ${geminiError.message}, using original`);
+        enhancedAnswer = bestMatch.answer;
+      }
+
+      // Save interaction to chat history if session provided
+      if (sessionId) {
+        try {
+          const chatHistory = await this.getOrCreateChatHistory(clientId, sessionId);
+          await this.saveChatInteraction(
+            chatHistory, 
+            originalQuestion, 
+            originalQuestion, 
+            enhancedAnswer, 
+            bestScore >= 0.8 ? 'high' : bestScore >= 0.5 ? 'medium' : 'low',
+            bestScore,
+            userLanguage,
+            bestMatch.question
+          );
+        } catch (historyError) {
+          console.log(`[HISTORY] Failed to save interaction: ${historyError.message}`);
+        }
+      }
+
+      res.json({
+        success: true,
+        answer: enhancedAnswer,
+        score: bestScore,
+        confidence: bestScore >= 0.8 ? 'high' : bestScore >= 0.5 ? 'medium' : 'low',
+        type: 'suggestion_click',
+        matchedQuestion: bestMatch.question,
+        language: userLanguage,
+        enhanced: true
+      });
+
+    } catch (error) {
+      console.error('[SUGGESTION-CLICK] Error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to process suggestion click'
+      });
+    }
+  }
+
   // Get or create chat history for session
   async getOrCreateChatHistory(clientId, sessionId, userId = 'anonymous') {
     let chatHistory = await ChatHistory.findOne({ clientId, sessionId });
@@ -514,7 +648,7 @@ Enhanced query:`;
       const skip = (page - 1) * limit;
       
       const sessions = await ChatHistory.find({ clientId })
-        .select('sessionId userId metadata createdAt updatedAt')
+        .select('sessionId userId metadata.createdAt updatedAt')
         .sort({ 'metadata.lastActive': -1 })
         .limit(parseInt(limit))
         .skip(skip);
