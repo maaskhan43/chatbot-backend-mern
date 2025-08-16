@@ -3,6 +3,7 @@ const ClientQA = require('../models/ClientQA');
 const ChatHistory = require('../models/ChatHistory');
 const GeminiService = require('../services/gemini.service');
 const { cosineSimilarity } = require('../utils/vector.util');
+const mongoose = require('mongoose');
 
 class ChatController {
   constructor() {
@@ -13,6 +14,10 @@ class ChatController {
     this.getChatHistory = this.getChatHistory.bind(this);
     this.getChatSessions = this.getChatSessions.bind(this);
     this.deleteChatHistory = this.deleteChatHistory.bind(this);
+    this.handleWidgetRequest = this.handleWidgetRequest.bind(this);
+    
+    // Initialize Gemini service (it's exported as a singleton)
+    this.geminiService = GeminiService;
     
     // Define restricted question patterns
     this.restrictedPatterns = [
@@ -47,7 +52,7 @@ Examples of greetings:
 
 Response:`;
 
-      const result = await GeminiService.generateText(greetingPrompt);
+      const result = await this.geminiService.generateText(greetingPrompt);
       const isGreetingResponse = result.trim().toLowerCase();
       
       console.log(`[GREETING-AI] Query: "${query}" | AI Response: "${result}" | Is Greeting: ${isGreetingResponse === 'yes'}`);
@@ -89,9 +94,23 @@ Guidelines:
 
 Generate a greeting response:`;
 
-      const response = await GeminiService.generateText(greetingPrompt);
-      console.log(`[GREETING-AI] Generated response in ${language}: ${response.substring(0, 100)}...`);
-      return response.trim();
+      const response = await this.geminiService.generateText(greetingPrompt);
+      
+      if (response) {
+        console.log(`[GREETING-AI] Generated response in ${language}: ${response.substring(0, 100)}...`);
+        return response.trim();
+      } else {
+        console.log(`[GREETING-AI] No response from Gemini, using fallback`);
+        // Use fallback responses when Gemini fails
+        const fallbackResponses = {
+          'hi': 'नमस्ते! मैं आपके ज्ञान आधार से प्रश्नों में मदद करने के लिए यहाँ हूँ। आज मैं आपकी कैसे सहायता कर सकता हूँ?',
+          'es': '¡Hola! Estoy aquí para ayudarte con preguntas de nuestra base de conocimientos. ¿En qué puedo asistirte hoy?',
+          'fr': 'Bonjour! Je suis là pour vous aider avec des questions de notre base de connaissances. Comment puis-je vous aider aujourd\'hui?',
+          'de': 'Hallo! Ich bin hier, um Ihnen bei Fragen aus unserer Wissensdatenbank zu helfen. Wie kann ich Ihnen heute helfen?',
+          'en': 'Hello! I\'m here to help you with questions from our knowledge base. How can I assist you today?'
+        };
+        return fallbackResponses[language] || fallbackResponses['en'];
+      }
     } catch (error) {
       console.log(`[GREETING-AI] Error generating greeting: ${error.message}`);
       // Fallback responses based on language
@@ -111,6 +130,215 @@ Generate a greeting response:`;
     return this.restrictedPatterns.some(pattern => pattern.test(query));
   }
 
+  // Enhanced contact intent detection with type classification
+  async detectContactIntentWithType(query) {
+    if (!query) return { isContact: false, type: null };
+    
+    try {
+      const contactIntentPrompt = `
+Analyze the user query and determine:
+1. Is it asking for contact information?
+2. What specific type of contact info?
+
+Query: "${query}"
+
+Classify into one of these categories:
+- email: asking for email address, mail id, email contact
+- phone: asking for phone number, contact number, mobile number
+- general: asking for general contact info (could be either)
+- none: not asking for contact information
+
+Examples:
+- "give me contact" → general
+- "phone number" → phone  
+- "email address" → email
+- "mail id" → email
+- "contact number" → phone
+- "how to contact" → general
+
+Respond with only: email|phone|general|none
+
+Response:`;
+
+      const result = await this.geminiService.generateText(contactIntentPrompt);
+      const contactType = result.trim().toLowerCase();
+      
+      const isContact = ['email', 'phone', 'general'].includes(contactType);
+      console.log(`[CONTACT-AI] Query: "${query}" | Type: "${contactType}" | Is Contact: ${isContact}`);
+      
+      return { isContact, type: contactType };
+    } catch (error) {
+      console.log(`[CONTACT-AI] Error detecting contact intent: ${error.message}`);
+      // Fallback logic
+      const q = query.toLowerCase();
+      if (q.includes('phone') || q.includes('number') || q.includes('mobile')) {
+        return { isContact: true, type: 'phone' };
+      } else if (q.includes('email') || q.includes('mail')) {
+        return { isContact: true, type: 'email' };
+      } else if (q.includes('contact')) {
+        return { isContact: true, type: 'general' };
+      }
+      return { isContact: false, type: null };
+    }
+  }
+
+  // Search for contact information in Q&A data
+  async findContactInQA(clientId, contactType) {
+    try {
+      const qaData = await ClientQA.find({ clientId, status: 'completed' });
+      const allPairs = qaData.flatMap(doc => doc.pairs);
+      
+      // Search patterns based on contact type
+      let searchPatterns = [];
+      if (contactType === 'phone') {
+        searchPatterns = [
+          /phone.*number|contact.*number|mobile.*number|call.*us|phone.*contact/i,
+          /\+?\d{1,4}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}/
+        ];
+      } else if (contactType === 'email') {
+        searchPatterns = [
+          /email.*address|contact.*email|mail.*id|e-mail/i,
+          /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/
+        ];
+      } else {
+        // General contact - search for both
+        searchPatterns = [
+          /contact|phone|email|reach.*us|get.*in.*touch/i,
+          /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
+          /\+?\d{1,4}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}/
+        ];
+      }
+      
+      // Find matching Q&A pairs
+      for (const pair of allPairs) {
+        const question = pair.question.toLowerCase();
+        const answer = pair.answer;
+        
+        // Check if question matches contact patterns
+        const questionMatches = searchPatterns.some(pattern => pattern.test(question));
+        
+        if (questionMatches) {
+          console.log(`[CONTACT-QA] Found contact Q&A: "${pair.question}"`);
+          return {
+            found: true,
+            question: pair.question,
+            answer: pair.answer,
+            type: contactType
+          };
+        }
+      }
+      
+      return { found: false, type: contactType };
+    } catch (error) {
+      console.error('[CONTACT-QA] Error searching Q&A:', error);
+      return { found: false, type: contactType };
+    }
+  }
+
+  // Detect contact email intent (multilingual) - AI-powered
+  async detectContactIntent(query) {
+    if (!query) return false;
+    
+    try {
+      const contactIntentPrompt = `
+Analyze if the following user query is asking for contact information (email, phone, address, how to reach/contact).
+
+Query: "${query}"
+
+Consider queries in multiple languages (English, Hindi, Spanish, French, German, etc.) that might be asking for:
+- Email address or contact email
+- Phone number or contact number  
+- Physical address or location
+- General contact information
+- How to reach/contact someone
+- Ways to get in touch
+
+Examples of contact queries:
+- "give me contact", "contact info", "how to contact"
+- "email address", "phone number", "mail id"
+- "संपर्क", "ईमेल", "नंबर" (Hindi)
+- "contacto", "correo" (Spanish)
+- "contact", "courriel" (French)
+- "kontakt" (German)
+
+Is this asking for contact information? Respond with only "YES" or "NO".
+
+Response:`;
+
+      const result = await this.geminiService.generateText(contactIntentPrompt);
+      const isContactIntent = result.trim().toLowerCase() === 'yes';
+      
+      console.log(`[CONTACT-AI] Query: "${query}" | AI Response: "${result}" | Is Contact Intent: ${isContactIntent}`);
+      return isContactIntent;
+    } catch (error) {
+      console.log(`[CONTACT-AI] Error detecting contact intent: ${error.message}`);
+      // Fallback to simple pattern matching
+      const q = query.toLowerCase();
+      const basicPatterns = [
+        /\b(contact|email|phone|mail|reach)\b/i
+      ];
+      return basicPatterns.some(p => p.test(q));
+    }
+  }
+
+  // LLM-based intent classification for short/ambiguous queries
+  async classifyIntent(query) {
+    try {
+      const prompt = `Classify the user's intent into EXACTLY one of the following labels:
+contact_email | contact_phone | website | pricing | appointment | other
+
+Rules:
+- Output ONLY the label, nothing else.
+- Consider multilingual input (English, Hindi, Spanish, French, German, Hinglish).
+- Examples:
+  - "email", "mail id", "ईमेल", "correo" -> contact_email
+  - "phone number", "contact number", "नंबर" -> contact_phone
+  - "website", "site", "वेबसाइट" -> website
+  - "price", "pricing", "cost", "किंमत", "precio" -> pricing
+  - "book appointment", "schedule a call" -> appointment
+  - otherwise -> other
+
+User query: "${query}"
+
+Label:`;
+
+      const raw = await this.geminiService.generateText(prompt);
+      const label = (raw || '').trim().toLowerCase();
+      const allowed = new Set(['contact_email', 'contact_phone', 'website', 'pricing', 'appointment', 'other']);
+      const cleaned = label.replace(/[^a-z_]/g, '');
+      return allowed.has(cleaned) ? cleaned : 'other';
+    } catch (e) {
+      console.log('[INTENT] classifyIntent failed, defaulting to other:', e.message);
+      return 'other';
+    }
+  }
+
+  // Check if query is a direct question match from knowledge base (skip refinement)
+  async isDirectQuestionMatch(query, clientId) {
+    try {
+      const qaDocuments = await ClientQA.find({ clientId });
+      
+      for (const doc of qaDocuments) {
+        for (const qaPair of doc.pairs) {
+          // Check for exact or very close match (case-insensitive)
+          const questionLower = qaPair.question.toLowerCase().trim();
+          const queryLower = query.toLowerCase().trim();
+          
+          if (questionLower === queryLower || 
+              questionLower.includes(queryLower) || 
+              queryLower.includes(questionLower)) {
+            console.log(`[DIRECT-MATCH] Found direct question match: "${qaPair.question}"`);
+            return true;
+          }
+        }
+      }
+      return false;
+    } catch (error) {
+      console.error('Error checking direct question match:', error);
+      return false; // Fallback to normal processing
+    }
+  }
+
   // Filter WH-words and helping verbs
   filterKeywords(query) {
     const whWords = new Set(['who', 'what', 'when', 'where', 'why', 'how', 'which', 'whom', 'whose']);
@@ -126,24 +354,17 @@ Generate a greeting response:`;
 
   // Detect query language using Gemini (more accurate than hardcoded patterns)
   async detectLanguage(query) {
-    return await GeminiService.detectLanguage(query);
+    return await this.geminiService.detectLanguage(query);
   }
 
   // Enhanced match evaluation with multiple confidence tiers
   evaluateMatchConfidence(score) {
-    if (score >= 0.80) {
+    if (score > 0.7) {
       return {
         level: 'high',
         description: 'High confidence match',
         shouldReturnAnswer: true,
         includeConfidenceNote: false
-      };
-    } else if (score >= 0.60) {
-      return {
-        level: 'medium',
-        description: 'Medium confidence match',
-        shouldReturnAnswer: true,
-        includeConfidenceNote: true
       };
     } else {
       return {
@@ -155,14 +376,35 @@ Generate a greeting response:`;
     }
   }
 
-  // Format suggestions with enhanced metadata
-  formatSuggestions(matches, originalQuery) {
-    return matches.map((match, index) => ({
-      id: `suggestion_${index + 1}`,
-      question: match.question,
-      score: parseFloat(match.score.toFixed(4)),
-      relevanceReason: this.generateRelevanceReason(match.score)
-    }));
+  // Format suggestions with enhanced metadata and translation
+  async formatSuggestions(matches, originalQuery, userLanguage = 'en') {
+    const suggestions = [];
+    
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i];
+      let translatedQuestion = match.question;
+      
+      // Translate suggestion if user language is not English
+      if (userLanguage !== 'en') {
+        try {
+          translatedQuestion = await this.geminiService.translateResponse(match.question, userLanguage);
+          console.log(`[SUGGESTION-TRANSLATE] ${userLanguage}: "${match.question}" → "${translatedQuestion}"`);
+        } catch (error) {
+          console.error('Error translating suggestion:', error);
+          // Keep original question if translation fails
+        }
+      }
+      
+      suggestions.push({
+        id: `suggestion_${i + 1}`,
+        question: translatedQuestion,
+        originalQuestion: match.question, // Keep original for backend processing
+        score: parseFloat(match.score.toFixed(4)),
+        relevanceReason: this.generateRelevanceReason(match.score)
+      });
+    }
+    
+    return suggestions;
   }
 
   // Generate relevance reason based on score
@@ -182,6 +424,35 @@ Generate a greeting response:`;
           success: false,
           message: 'Client ID is required'
         });
+      }
+
+      // Dynamic LLM-based intent classification for short queries
+      const tokenCount = query.trim().split(/\s+/).filter(Boolean).length;
+      if (tokenCount <= 4) {
+        const intent = await this.classifyIntent(query);
+        if (intent === 'contact_email') {
+          console.log('[INTENT] LLM classified as contact_email. Searching for contact information in Q&A data.');
+          const detectedLanguage = await this.geminiService.detectLanguage(query);
+          const contactInfo = await this.findContactInQA(clientId, 'email');
+          if (contactInfo.found) {
+            const answer = contactInfo.answer;
+            const translated = await this.geminiService.translateResponse(answer, detectedLanguage);
+            await this.saveChatInteraction(chatHistory, query, query, translated, 'high', 1.0, detectedLanguage, 'contact_email');
+            return res.json({
+              answer: translated,
+              score: 1.0,
+              confidence: 'high',
+              type: 'contact_email',
+              language: detectedLanguage
+            });
+          } else {
+            return res.json({
+              answer: "I'm sorry, I couldn't find any contact information in our knowledge base.",
+              score: 0,
+              type: 'no_data'
+            });
+          }
+        }
       }
 
       const client = await Client.findById(clientId);
@@ -233,14 +504,23 @@ Generate a greeting response:`;
         console.log('[GREETING] Detected greeting message, generating dynamic AI-powered response.');
         
         // Detect language for contextual greeting
-        const detectedLanguage = await GeminiService.detectLanguage(query);
+        const detectedLanguage = await this.geminiService.detectLanguage(query);
         
         // Generate contextual greeting response
         const greetingResponse = await this.generateGreetingResponse(query, detectedLanguage, chatHistory);
         
         // Save greeting interaction to history
-        await this.saveChatInteraction(chatHistory, query, query, greetingResponse, 'high', 1.0, detectedLanguage, 'greeting');
-        
+        await this.saveChatInteraction(
+          chatHistory, 
+          query, 
+          query, 
+          greetingResponse, 
+          'high', 
+          1.0, 
+          detectedLanguage, 
+          'greeting'
+        );
+
         return res.json({ 
           answer: greetingResponse, 
           score: 1.0,
@@ -260,28 +540,65 @@ Generate a greeting response:`;
         });
       }
 
-      // Build context-aware query using chat history
-      const contextAwareQuery = await this.buildContextAwareQuery(query, chatHistory);
+      // Shortcut: contact email intent
+      const contactIntent = await this.detectContactIntentWithType(query);
+      if (contactIntent.isContact) {
+        console.log('[INTENT] Detected contact intent. Searching for contact information in Q&A data.');
+        const detectedLanguage = await this.geminiService.detectLanguage(query);
+        const contactInfo = await this.findContactInQA(clientId, contactIntent.type);
+        if (contactInfo.found) {
+          const answer = contactInfo.answer;
+          const translated = await this.geminiService.translateResponse(answer, detectedLanguage);
+          await this.saveChatInteraction(chatHistory, query, query, translated, 'high', 1.0, detectedLanguage, contactIntent.type);
+          return res.json({
+            answer: translated,
+            score: 1.0,
+            confidence: 'high',
+            type: contactIntent.type,
+            language: detectedLanguage
+          });
+        } else {
+          return res.json({
+            answer: "I'm sorry, I couldn't find any contact information in our knowledge base.",
+            score: 0,
+            type: 'no_data'
+          });
+        }
+      }
 
-      // --- Query Refinement and Filtering ---
-      console.log('[PRE-PROCESSING] Starting query refinement and filtering...');
-      // 1. Refine the context-aware query with Gemini for semantic richness
-      const refinedQuery = await GeminiService.refineQuery(contextAwareQuery);
+      // Check if this is a direct question match (from suggestions) - skip refinement
+      const isDirectQuestionMatch = await this.isDirectQuestionMatch(query, clientId);
+      
+      let refinedQuery = query;
+      let filteredKeywords = '';
+      
+      if (!isDirectQuestionMatch) {
+        // Build context-aware query using chat history
+        const contextAwareQuery = await this.buildContextAwareQuery(query, chatHistory);
 
-      // 2. Filter keywords for logging or future hybrid search (vector search will use the full refined query)
-      const filteredKeywords = this.filterKeywords(refinedQuery);
-      console.log(`[PRE-PROCESSING] Using refined query for vector search: '${refinedQuery}'`);
+        // --- Query Refinement and Filtering ---
+        console.log('[PRE-PROCESSING] Starting query refinement and filtering...');
+        // 1. Refine the context-aware query with Gemini for semantic richness
+        refinedQuery = await this.geminiService.refineQuery(contextAwareQuery);
+
+        // 2. Filter keywords for logging or future hybrid search (vector search will use the full refined query)
+        filteredKeywords = this.filterKeywords(refinedQuery);
+        console.log(`[PRE-PROCESSING] Using refined query for vector search: '${refinedQuery}'`);
+      } else {
+        console.log('[PRE-PROCESSING] Direct question match detected, skipping refinement');
+        filteredKeywords = this.filterKeywords(query);
+      }
 
       // Detect query language using Gemini (more accurate than hardcoded patterns)
-      const originalLanguage = await GeminiService.detectLanguage(query);
+      const originalLanguage = await this.geminiService.detectLanguage(query);
       console.log(`[LANGUAGE] Detected language: ${originalLanguage}`);
 
-      // Set similarity threshold
-      const baseSimilarityThreshold = 0.6;
+      // Set similarity threshold (only return answers when score >= 0.7)
+      const baseSimilarityThreshold = 0.7;
       console.log(`[i] Using base similarity threshold: ${baseSimilarityThreshold}`);
 
       // Generate embedding for the refined query
-      const queryEmbedding = await GeminiService.generateEmbedding(refinedQuery);
+      const queryEmbedding = await this.geminiService.generateEmbedding(refinedQuery);
       if (!queryEmbedding) {
         return res.status(500).json({ message: 'Failed to generate query embedding.' });
       }
@@ -318,61 +635,262 @@ Generate a greeting response:`;
         console.log(`  ${index + 1}. Score: ${match.score.toFixed(4)} | Question: ${match.question}`);
       });
 
-      const bestMatch = topMatches[0];
+      let bestMatch = topMatches[0];
       const matchEvaluation = this.evaluateMatchConfidence(bestMatch ? bestMatch.score : 0);
       console.log(`[EVALUATION] Match confidence: ${matchEvaluation.level} (${matchEvaluation.description || 'Confidence evaluation'})`);
 
       if (bestMatch && bestMatch.score >= baseSimilarityThreshold) {
-        console.log(`[6] ${matchEvaluation.level} confidence match. Returning answer.`);
+        console.log(`[6] ${matchEvaluation.level} confidence match. Checking for answer synthesis.`);
         
-        let responseAnswer = bestMatch.answer;
+        // Check if multiple relevant answers should be combined
+        const relevantMatches = topMatches.filter(match => match.score >= 0.6).slice(0, 3);
+        
+        // Intelligent query analysis - understand specific intent
+        let shouldSynthesize = false;
+        let specificMatch = null;
+        
+        if (relevantMatches.length > 1) {
+          try {
+            const intentAnalysisPrompt = `
+Analyze if the user wants SPECIFIC information or GENERAL information.
 
-        // Add confidence note for medium confidence answers
-        if (matchEvaluation.level === 'medium' && matchEvaluation.message) {
-          responseAnswer += `\n\n*Note: ${matchEvaluation.message}*`;
+Query: "${query}"
+
+Available answers:
+${relevantMatches.map((match, index) => `${index + 1}. ${match.answer.substring(0, 80)}...`).join('\n')}
+
+Rules:
+- If asking for specific plan/price (like "$299 plan", "starter plan", "between $50-$499"), return "SPECIFIC:X" (X = best match number)
+- If asking for general overview ("what services", "all plans", "what do you offer"), return "GENERAL"
+
+Response format: SPECIFIC:1 or GENERAL
+
+Analysis:`;
+
+            const intentResult = await this.geminiService.generateText(intentAnalysisPrompt);
+            const intentMatch = intentResult.trim().match(/^(SPECIFIC|GENERAL)(?::(\d+))?/);
+            
+            if (intentMatch) {
+              const intentType = intentMatch[1];
+              const specificIndex = intentMatch[2] ? parseInt(intentMatch[2]) - 1 : 0;
+              
+              console.log(`[INTENT-ANALYSIS] Query intent: ${intentType}${intentMatch[2] ? `, specific match: ${intentMatch[2]}` : ''}`);
+              
+              if (intentType === 'SPECIFIC' && relevantMatches[specificIndex]) {
+                specificMatch = relevantMatches[specificIndex];
+                console.log(`[SPECIFIC-MATCH] Using specific answer instead of synthesis`);
+              } else if (intentType === 'GENERAL') {
+                shouldSynthesize = true;
+                console.log(`[SYNTHESIS] Will combine answers for general query`);
+              }
+            }
+          } catch (analysisError) {
+            console.log(`[INTENT-ANALYSIS] Error: ${analysisError.message}, using single answer`);
+          }
+        }
+        
+        // Use specific match if identified
+        if (specificMatch) {
+          bestMatch = specificMatch; // Override bestMatch with specific match
+        }
+        
+        // Synthesize answers for general queries only
+        if (shouldSynthesize && !specificMatch) {
+          console.log(`[SYNTHESIS] Found ${relevantMatches.length} relevant matches. Combining answers.`);
+          
+          try {
+            const synthesisPrompt = `
+Combine the following relevant answers into one comprehensive, coherent response for the user's question.
+
+User Question: "${query}"
+
+Relevant Answers:
+${relevantMatches.map((match, index) => `${index + 1}. ${match.answer}`).join('\n')}
+
+Instructions:
+1. Merge all relevant information into one complete answer
+2. Remove duplicate information
+3. Keep the response concise and direct
+4. Maintain all important details
+5. Use simple, clear language
+6. No asterisks, bullet points, or formatting symbols
+7. Present as one flowing answer
+
+Combined Answer:`;
+
+            const synthesizedAnswer = await this.geminiService.generateText(synthesisPrompt);
+            
+            if (synthesizedAnswer && synthesizedAnswer.trim().length > 0) {
+              // Clean the synthesized answer
+              let finalAnswer = synthesizedAnswer.trim()
+                .replace(/\*+/g, '') // Remove asterisks
+                .replace(/•/g, '') // Remove bullet points
+                .replace(/\*\*/g, '') // Remove bold formatting
+                .replace(/#+/g, '') // Remove headers
+                .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+                .trim();
+
+              console.log(`[SYNTHESIS] Successfully combined ${relevantMatches.length} answers`);
+
+              // Translate response if needed
+              const translatedAnswer = await this.geminiService.translateResponse(finalAnswer, originalLanguage);
+
+              // Save interaction to history
+              await this.saveChatInteraction(
+                chatHistory, 
+                query, 
+                refinedQuery, 
+                translatedAnswer, 
+                'high', 
+                bestMatch.score, 
+                originalLanguage, 
+                'synthesized_answer'
+              );
+
+              return res.json({
+                answer: translatedAnswer,
+                score: bestMatch.score,
+                confidence: 'high',
+                type: 'synthesized_answer',
+                language: originalLanguage,
+                sourceCount: relevantMatches.length
+              });
+            }
+          } catch (synthesisError) {
+            console.log(`[SYNTHESIS] Error combining answers: ${synthesisError.message}, using single answer`);
+          }
+        }
+        
+        // Process single answer (either specific match or fallback)
+        console.log(`[6] Using single answer processing.`);
+        
+        let rawAnswer = bestMatch.answer;
+        
+        // Regex to detect and remove prefixes like "Q1:", "Q91:", "Question:" etc.
+        const questionPrefixRegex = /^(Q\d+:|Question:)\s*/i;
+        const cleanedAnswer = rawAnswer.replace(questionPrefixRegex, '').trim();
+        
+        // Remove asterisks and formatting symbols from stored answers
+        let finalCleanedAnswer = cleanedAnswer
+          .replace(/\*+/g, '') // Remove all asterisks
+          .replace(/•/g, '') // Remove bullet points
+          .replace(/\*\*/g, '') // Remove bold formatting
+          .replace(/#+/g, '') // Remove headers
+          .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+          .trim();
+        
+        let finalAnswer = finalCleanedAnswer;
+
+        // Apply dynamic answer template
+        try {
+          finalAnswer = await this.applyDynamicTemplate(query, finalAnswer);
+        } catch (templateError) {
+          console.log(`[TEMPLATE] Error applying template: ${templateError.message}`);
         }
 
+        // Smart answer extraction - make answers direct and concise
+        try {
+          const extractionPrompt = `
+Extract the most direct and concise answer from the following Q&A response. Remove unnecessary theory, explanations, or fluff.
+
+User asked: "${query}"
+Full response: "${cleanedAnswer}"
+
+Rules:
+1. Give ONLY the essential information the user needs
+2. Remove marketing language, unnecessary details, theory
+3. For contact info: just give email/phone directly
+4. For pricing: just state the price and key features
+5. For services: list main services only
+6. Keep it concise (1-2 sentences)
+7. Be direct and helpful
+
+Direct answer:`;
+
+          const directAnswer = await this.geminiService.generateText(extractionPrompt);
+          if (directAnswer && directAnswer.trim().length > 0 && directAnswer.trim().length < cleanedAnswer.length) {
+            finalAnswer = directAnswer.trim();
+            console.log(`[EXTRACT] Made answer more direct: ${cleanedAnswer.length} → ${finalAnswer.length} chars`);
+          }
+        } catch (extractError) {
+          console.log(`[EXTRACT] Error extracting direct answer: ${extractError.message}`);
+          // Use cleaned answer as fallback
+        }
+        
+        // --- End of Processing ---
+        
         // Translate response if needed
-        if (originalLanguage !== 'en') {
-          console.log(`[TRANSLATION] Translating response to ${originalLanguage}`);
-          responseAnswer = await GeminiService.translateResponse(responseAnswer, originalLanguage);
+        const translatedAnswer = await this.geminiService.translateResponse(finalAnswer, originalLanguage);
+
+        // Generate smart follow-up questions (top 3 only)
+        let followUpQuestions = [];
+        try {
+          followUpQuestions = await this.generateFollowUpQuestions(query, finalAnswer);
+        } catch (followUpError) {
+          console.log(`[FOLLOW-UP] Error generating follow-up questions: ${followUpError.message}`);
         }
 
-        // Save chat interaction to history
-        await this.saveChatInteraction(chatHistory, query, refinedQuery, responseAnswer, matchEvaluation.level, bestMatch.score, originalLanguage, bestMatch.question);
+        // Check answer completeness
+        let completenessScore = 1.0;
+        let enrichedAnswer = translatedAnswer;
+        try {
+          completenessScore = await this.checkAnswerCompleteness(query, finalAnswer);
+          // If completeness is low, try to enrich the answer
+          if (completenessScore < 0.8) {
+            const newEnrichedAnswer = await this.enrichAnswer(query, finalAnswer);
+            if (newEnrichedAnswer) {
+              enrichedAnswer = newEnrichedAnswer;
+            }
+          }
+        } catch (completenessError) {
+          console.log(`[COMPLETENESS] Error checking completeness: ${completenessError.message}`);
+        }
 
-        res.json({ 
-          answer: responseAnswer,
+        // Save interaction to history
+        await this.saveChatInteraction(
+          chatHistory, 
+          query, 
+          refinedQuery, 
+          enrichedAnswer, 
+          matchEvaluation.level, 
+          bestMatch.score, 
+          originalLanguage, 
+          bestMatch.question
+        );
+
+        return res.json({
+          answer: enrichedAnswer,
           score: bestMatch.score,
           confidence: matchEvaluation.level,
           type: 'answer',
           language: originalLanguage,
           matchedQuestion: bestMatch.question,
-          metadata: {
-            originalQuery: query,
-            refinedQuery: refinedQuery,
-            filteredKeywords: filteredKeywords
-          }
+          completenessScore: completenessScore,
+          followUpQuestions: followUpQuestions.length > 0 ? followUpQuestions : undefined
         });
+
       } else {
-        console.log('[6] Low confidence match. Returning enhanced suggested questions.');
-        
-        // Enhanced suggestion system with better metadata
-        const enhancedSuggestions = this.formatSuggestions(topMatches);
-        let suggestionMessage = "I couldn't find a direct answer in our knowledge base with high confidence. Here are some related questions that might help:";
+        // Low confidence or no match, return suggestions
+        console.log('[6] Low confidence match or no match found. Returning suggestions.');
 
-        // Translate suggestion message if needed
+        const suggestions = await this.formatSuggestions(topMatches, query, originalLanguage);
+
+        // Save interaction to history
+        await this.saveChatInteraction(chatHistory, query, refinedQuery, 'suggestions_provided', 'low', bestMatch ? bestMatch.score : 0, originalLanguage, null);
+
+        // Translate the "no answer found" message to user's language
+        let noAnswerMessage = "I couldn't find a direct answer to your question, but here are some related topics that might help:";
         if (originalLanguage !== 'en') {
-          console.log(`[TRANSLATION] Translating suggestion message to ${originalLanguage}`);
-          suggestionMessage = await GeminiService.translateResponse(suggestionMessage, originalLanguage);
+          try {
+            noAnswerMessage = await this.geminiService.translateResponse(noAnswerMessage, originalLanguage);
+          } catch (error) {
+            console.error('Error translating no-answer message:', error);
+          }
         }
-        
-        // Save chat interaction to history
-        await this.saveChatInteraction(chatHistory, query, refinedQuery, suggestionMessage, 'low', bestMatch ? bestMatch.score : 0, originalLanguage, bestMatch ? bestMatch.question : '');
 
-        res.json({
-          answer: suggestionMessage,
-          suggestedQuestions: enhancedSuggestions,
+        return res.json({
+          answer: noAnswerMessage,
+          suggestions: suggestions,
           score: bestMatch ? bestMatch.score : 0,
           confidence: 'low',
           type: 'suggestions',
@@ -416,7 +934,7 @@ Generate a greeting response:`;
       }
 
       // Get Q&A data for the client
-      const qaData = await ClientQA.find({ clientId }).select('question answer embedding priority');
+      const qaData = await ClientQA.find({ clientId }).select('pairs');
       
       if (!qaData || qaData.length === 0) {
         return res.status(404).json({
@@ -430,23 +948,28 @@ Generate a greeting response:`;
       let bestScore = 0;
 
       for (const qa of qaData) {
-        // Check for exact match first
-        if (qa.question.toLowerCase().trim() === originalQuestion.toLowerCase().trim()) {
-          bestMatch = qa;
-          bestScore = 1.0;
-          break;
+        for (const pair of qa.pairs) {
+          // Check for exact match first
+          if (pair.question && pair.question.toLowerCase().trim() === originalQuestion.toLowerCase().trim()) {
+            bestMatch = pair;
+            bestScore = 1.0;
+            break;
+          }
+          
+          // Simple text similarity as fallback
+          if (pair.question) {
+            const words1 = originalQuestion.toLowerCase().split(' ');
+            const words2 = pair.question.toLowerCase().split(' ');
+            const commonWords = words1.filter(word => words2.includes(word));
+            const similarity = commonWords.length / Math.max(words1.length, words2.length);
+            
+            if (similarity > bestScore) {
+              bestMatch = pair;
+              bestScore = similarity;
+            }
+          }
         }
-        
-        // Simple text similarity as fallback
-        const words1 = originalQuestion.toLowerCase().split(' ');
-        const words2 = qa.question.toLowerCase().split(' ');
-        const commonWords = words1.filter(word => words2.includes(word));
-        const similarity = commonWords.length / Math.max(words1.length, words2.length);
-        
-        if (similarity > bestScore) {
-          bestMatch = qa;
-          bestScore = similarity;
-        }
+        if (bestScore === 1.0) break; // Exit outer loop if exact match found
       }
 
       if (!bestMatch || bestScore < 0.3) {
@@ -456,36 +979,20 @@ Generate a greeting response:`;
         });
       }
 
-      // Enhanced flow: Process answer through Gemini AI for beautification
+      // Return clean answer without enhancement
       let enhancedAnswer = bestMatch.answer;
       
-      try {
-        const enhancementPrompt = `
-You are a professional customer service assistant. Please enhance and beautify the following answer to make it more natural, polished, and user-friendly while maintaining all the original information.
-
-Original Question: "${originalQuestion}"
-User Language: ${userLanguage}
-Raw Answer: "${bestMatch.answer}"
-
-Guidelines:
-1. Make the response sound more conversational and natural
-2. Maintain all factual information from the original answer
-3. Respond in ${userLanguage === 'en' ? 'English' : userLanguage}
-4. Use proper formatting with bullet points or paragraphs if needed
-5. Be helpful and professional
-6. Keep the same core meaning but improve readability
-
-Enhanced Answer:`;
-
-        const geminiResponse = await GeminiService.generateText(enhancementPrompt);
-        enhancedAnswer = geminiResponse.trim() || bestMatch.answer;
-        
-        console.log(`[GEMINI-ENHANCEMENT] Original: "${bestMatch.answer.substring(0, 100)}..." | Enhanced: "${enhancedAnswer.substring(0, 100)}..."`);
-      } catch (geminiError) {
-        console.log(`[GEMINI-ENHANCEMENT] Failed to enhance answer: ${geminiError.message}, using original`);
-        enhancedAnswer = bestMatch.answer;
-      }
-
+      // Remove formatting symbols from the answer
+      enhancedAnswer = enhancedAnswer
+        .replace(/\*+/g, '') // Remove asterisks
+        .replace(/•/g, '') // Remove bullet points
+        .replace(/\*\*/g, '') // Remove bold formatting
+        .replace(/#+/g, '') // Remove headers
+        .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+        .trim();
+      
+      console.log(`[CLEAN-ANSWER] Cleaned formatting from suggestion answer`);
+      
       // Save interaction to chat history if session provided
       if (sessionId) {
         try {
@@ -513,7 +1020,7 @@ Enhanced Answer:`;
         type: 'suggestion_click',
         matchedQuestion: bestMatch.question,
         language: userLanguage,
-        enhanced: true
+        enhanced: false
       });
 
     } catch (error) {
@@ -521,6 +1028,65 @@ Enhanced Answer:`;
       res.status(500).json({
         success: false,
         message: 'Failed to process suggestion click'
+      });
+    }
+  }
+
+  // Handle widget chat requests
+  async handleWidgetRequest(req, res) {
+    try {
+      const { clientId, query, sessionId } = req.body;
+
+      if (!clientId || !query) {
+        return res.status(400).json({
+          success: false,
+          message: 'Client ID and query are required'
+        });
+      }
+
+      // Create a mock request object for semanticSearch
+      const mockReq = {
+        body: { query, clientId, sessionId }
+      };
+
+      // Create a mock response object to capture the result
+      let semanticResult = null;
+      const mockRes = {
+        json: (data) => {
+          semanticResult = data;
+          return mockRes;
+        },
+        status: (code) => mockRes
+      };
+
+      // Call the same semanticSearch logic used by admin panel
+      await this.semanticSearch(mockReq, mockRes);
+
+      if (semanticResult) {
+        // Extract follow-up questions if they exist
+        const followUpQuestions = semanticResult.followUpQuestions || [];
+        const completenessScore = semanticResult.completenessScore || 100;
+        const suggestions = semanticResult.suggestions || [];
+
+        return res.json({
+          success: true,
+          response: semanticResult.answer,
+          suggestions: suggestions,
+          followUpQuestions: followUpQuestions,
+          completenessScore: completenessScore
+        });
+      } else {
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to process request'
+        });
+      }
+
+    } catch (error) {
+      console.error('Widget request error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Internal server error'
       });
     }
   }
@@ -578,30 +1144,166 @@ Please enhance the current query by considering the conversation context. If the
 
 Enhanced query:`;
 
-      const enhancedQuery = await GeminiService.generateText(contextPrompt);
-      console.log(`[CONTEXT] Original: "${originalQuery}" | Enhanced: "${enhancedQuery}"`);
-      return enhancedQuery || originalQuery;
+      const enhancedQuery = await this.geminiService.generateText(contextPrompt);
+      
+      if (enhancedQuery && enhancedQuery.trim() !== originalQuery.trim()) {
+        // Validate that enhanced query is actually related to original query
+        const originalWords = originalQuery.toLowerCase().split(/\s+/);
+        const enhancedWords = enhancedQuery.toLowerCase().split(/\s+/);
+        
+        // Check if enhanced query has at least one significant word from original
+        const hasCommonWords = originalWords.some(word => 
+          word.length > 3 && enhancedWords.includes(word)
+        );
+        
+        if (hasCommonWords) {
+          console.log(`[CONTEXT] Original: "${originalQuery}" | Enhanced: "${enhancedQuery}"`);
+          return enhancedQuery.trim();
+        } else {
+          console.log(`[CONTEXT] Enhanced query seems unrelated, using original: "${originalQuery}"`);
+          return originalQuery;
+        }
+      }
     } catch (error) {
-      console.log(`[CONTEXT] Failed to enhance query: ${error.message}`);
-      return originalQuery;
+      console.error('Error building context-aware query:', error);
     }
+    
+    return originalQuery; // Fallback to original query
   }
 
-  // Save chat interaction to history
-  async saveChatInteraction(chatHistory, query, refinedQuery, response, confidence, score, language, matchedQuestion) {
-    const messageData = {
-      query,
-      refinedQuery,
-      response,
-      confidence,
-      score,
-      language,
-      matchedQuestion,
-      timestamp: new Date()
-    };
+  // Apply dynamic answer template using Gemini
+  async applyDynamicTemplate(query, answer) {
+    try {
+      const templatePrompt = `
+Identify the query type and format the answer using the appropriate template:
 
-    await chatHistory.addMessage(messageData);
-    console.log(`[HISTORY] Saved interaction - Query: "${query}" | Confidence: ${confidence}`);
+Query: "${query}"
+Answer: "${answer}"
+
+Templates:
+- PRICING: "Price: $X. Features: A, B, C. Duration: Y."
+- CONTACT: "Email: X. Phone: Y. Address: Z."
+- FEATURES: "Main features: A, B, C. Benefits: X, Y, Z."
+- SERVICES: "We offer: A, B, C."
+- OTHER: Keep as-is
+
+Apply the template if it matches, otherwise keep original. No formatting symbols.
+
+Formatted Answer:`;
+
+      const templateResult = await this.geminiService.generateText(templatePrompt);
+      if (templateResult && templateResult.trim().length > 0) {
+        const formattedAnswer = templateResult.trim()
+          .replace(/\*+/g, '') // Remove asterisks
+          .replace(/•/g, '') // Remove bullet points
+          .replace(/\*\*/g, '') // Remove bold formatting
+          .replace(/#+/g, '') // Remove headers
+          .replace(/\s+/g, ' ') // Replace multiple spaces
+          .trim();
+        
+        if (formattedAnswer.length > 0) {
+          console.log(`[TEMPLATE] Applied dynamic answer template`);
+          return formattedAnswer;
+        }
+      }
+    } catch (templateError) {
+      console.log(`[TEMPLATE] Error applying template: ${templateError.message}`);
+    }
+    return answer; // Return original answer on error or no-op
+  }
+
+  // Generate follow-up questions using Gemini
+  async generateFollowUpQuestions(query, answer) {
+    try {
+      const followUpPrompt = `
+Based on the user's question and the answer provided, suggest 3 relevant follow-up questions they might want to ask next.
+
+User Question: "${query}"
+Answer: "${answer}"
+
+Generate 3 short, relevant follow-up questions that would naturally come next. Focus on:
+- Related features or details
+- Next steps or actions
+- Comparisons or alternatives
+- Pricing or availability (if relevant)
+
+Format as simple questions, one per line:
+
+Follow-up questions:`;
+
+      const followUpResult = await this.geminiService.generateText(followUpPrompt);
+      if (followUpResult) {
+        const questions = followUpResult
+          .split('\n')
+          .filter(q => q.trim().length > 0)
+          .slice(0, 3)
+          .map(q => q.trim().replace(/^\d+\.\s*/, '').replace(/^-\s*/, ''));
+        console.log(`[FOLLOW-UP] Generated ${questions.length} follow-up questions`);
+        return questions;
+      }
+    } catch (followUpError) {
+      console.log(`[FOLLOW-UP] Error generating follow-up questions: ${followUpError.message}`);
+    }
+    return []; // Return empty array on error
+  }
+
+  // Check answer completeness using Gemini
+  async checkAnswerCompleteness(query, answer) {
+    try {
+      const completenessPrompt = `
+Rate how completely this answer addresses the user's question on a scale of 0.0 to 1.0.
+
+User Question: "${query}"
+Answer: "${answer}"
+
+Consider:
+- Does it answer the main question?
+- Are important details missing?
+- Would a user need to ask follow-up questions for basic info?
+
+Respond with only a number between 0.0 and 1.0:`;
+
+      const completenessResult = await this.geminiService.generateText(completenessPrompt);
+      const score = parseFloat(completenessResult.trim());
+      if (!isNaN(score) && score >= 0 && score <= 1) {
+        console.log(`[COMPLETENESS] Answer completeness score: ${score}`);
+        return score;
+      }
+    } catch (completenessError) {
+      console.log(`[COMPLETENESS] Error checking completeness: ${completenessError.message}`);
+    }
+    return 1.0; // Default to 1.0 on error
+  }
+
+  // Enrich answer using Gemini
+  async enrichAnswer(query, currentAnswer) {
+    try {
+      const enrichmentPrompt = `
+The following answer seems incomplete for the user's question. Add any missing essential information to make it more complete.
+
+User Question: "${query}"
+Current Answer: "${currentAnswer}"
+
+Add only the most important missing information. Keep it concise and direct. No formatting symbols.
+
+Enhanced Answer:`;
+
+      const enrichedResult = await this.geminiService.generateText(enrichmentPrompt);
+      if (enrichedResult && enrichedResult.trim().length > currentAnswer.length) {
+        const finalAnswer = enrichedResult.trim()
+          .replace(/\*+/g, '') // Remove asterisks
+          .replace(/•/g, '') // Remove bullet points
+          .replace(/\*\*/g, '') // Remove bold formatting
+          .replace(/#+/g, '') // Remove headers
+          .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+          .trim();
+        console.log(`[ENRICHMENT] Enhanced answer for better completeness`);
+        return finalAnswer;
+      }
+    } catch (enrichmentError) {
+      console.log(`[ENRICHMENT] Error enriching answer: ${enrichmentError.message}`);
+    }
+    return null; // Return null if no enrichment occurs
   }
 
   // Get chat history for a specific session
@@ -706,6 +1408,27 @@ Enhanced query:`;
         success: false, 
         message: 'Error deleting chat history' 
       });
+    }
+  }
+
+  // Save chat interaction to history
+  async saveChatInteraction(chatHistory, query, refinedQuery, response, confidence, score, language, matchedQuestion) {
+    try {
+      const messageData = {
+        query,
+        refinedQuery,
+        response,
+        confidence,
+        score,
+        language,
+        matchedQuestion,
+        timestamp: new Date()
+      };
+
+      await chatHistory.addMessage(messageData);
+      console.log(`[HISTORY] Saved interaction - Query: "${query}" | Confidence: ${confidence}`);
+    } catch (error) {
+      console.error('Error saving chat interaction:', error);
     }
   }
 }
